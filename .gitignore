@@ -1,0 +1,12 @@
+# Ignore API keys and secrets
+.env
+credentials.json
+temp_data/
+
+# Ignore Python cache
+__pycache__/
+*.py[cod]
+
+# Ignore Airflow logs and DB (if running locally)
+logs/
+airflow.db
