@@ -8,11 +8,8 @@ import pandas as pd
 from requests import Session
 from dotenv import load_dotenv
 
-
-#1 This is the path inside the Airflow Docker container
+# --- CONFIGURATION ---
 env_path = '/opt/airflow/dags/.env' 
-load_dotenv(env_path)
-
 load_dotenv(env_path)
 API_KEY = os.getenv('CMC_API_KEY') 
 
@@ -32,54 +29,60 @@ def run_crypto_etl():
     data = response.json()
     
     if 'data' in data:
-        # RAW EXTRACTION
         df = pd.json_normalize(data['data'])
         
         # TRANSFORMATION
-        # Cleaning up column names and filtering
         df.columns = [c.replace('quote.USD.', '') for c in df.columns]
         cols_to_keep = ['name', 'symbol', 'price', 'market_cap', 'percent_change_24h', 'last_updated']
         final_df = df[cols_to_keep]
         
-        # FIXED PATH: This points to the dags folder inside your Docker container
-        temp_csv = '/opt/airflow/dags/temp_crypto_data.csv'
+        # GENERATE UNIQUE FILENAME WITH TIMESTAMP
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        filename = f"temp_crypto_{timestamp}.csv"
+        temp_csv_path = os.path.join('/opt/airflow/dags/', filename)
         
-        final_df.to_csv(temp_csv, index=False)
-        return temp_csv
+        final_df.to_csv(temp_csv_path, index=False)
+        
+        # Returning this allows 'ti.xcom_pull' to see the exact filename
+        return temp_csv_path
     else:
-        # This will show up in your Airflow logs if the API fails
         raise ValueError(f"API Error: {data.get('status', {}).get('error_message')}")
 
 def load_to_minio(ti):
-    # Pull the file path from the previous task
+    # Pull the UNIQUE file path from the previous task
     file_path = ti.xcom_pull(task_ids='extract_and_transform')
     
-    # Use the connection ID you created in Airflow UI
     s3_hook = S3Hook(aws_conn_id='minio_s3_conn')
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    # We use the filename only for the S3 Key
+    s3_key = f"raw/{os.path.basename(file_path)}"
+    
     s3_hook.load_file(
         filename=file_path,
-        key=f"raw/crypto_data_{timestamp}.csv",
+        key=s3_key,
         bucket_name='crypto',
         replace=True
     )
 
 def load_to_postgres(ti):
+    # Pull the SAME unique file path
     file_path = ti.xcom_pull(task_ids='extract_and_transform')
     df = pd.read_csv(file_path)
     
-    # Use the connection ID you created in Airflow UI
     pg_hook = PostgresHook(postgres_conn_id='postgres_default')
     engine = pg_hook.get_sqlalchemy_engine()
     
+    # 'append' ensures your data grows every hour!
     df.to_sql('market_data', engine, if_exists='append', index=False)
+    
+    # Optional: Delete the local temp file after success to keep the folder clean
+    # os.remove(file_path)
 
 # --- DAG DEFINITION ---
 
 default_args = {
     'owner': 'Segun',
-    'start_date': datetime(2024, 3, 25),
+    'start_date': datetime(2026, 3, 30), # Updated to current date
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
 }
@@ -87,7 +90,7 @@ default_args = {
 with DAG(
     'coinmarketcap_full_stack_pipeline',
     default_args=default_args,
-    schedule_interval='@daily',
+    schedule_interval='@hourly',
     catchup=False
 ) as dag:
 
@@ -106,5 +109,5 @@ with DAG(
         python_callable=load_to_postgres
     )
 
-    # The Flow: Extract -> then Load to S3 & Postgres in parallel
+    # Parallel loading to Lake (MinIO) and Warehouse (Postgres)
     extract_task >> [minio_task, postgres_task]
